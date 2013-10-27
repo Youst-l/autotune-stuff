@@ -39,6 +39,35 @@
 
 #include "memory-check.h" // CHECK_MALLOC() macro
 
+struct default_writer_args {
+  ao_device *ao;
+  SNDFILE *sfout;
+  SF_INFO *sfout_info;
+};
+
+typedef int (*writer_fn)(long hop, double *l_out, double *r_out, void *user);
+
+int default_writer(long hop, double *l_out_src, double *r_out_src, void *user)
+{
+  int status;
+  struct default_writer_args *args = (struct default_writer_args *)user;
+  ao_device *ao = args->ao;
+  SNDFILE *sfout = args->sfout;
+  SF_INFO *sfout_info = args->sfout_info;
+
+  // output
+  if (sfout == NULL)
+  {
+    status = ao_write (ao, l_out_src, r_out_src, hop);
+    status /= 4; // 2 bytes for 2 channels
+  }
+  else
+  {
+    status = sndfile_write (sfout, *sfout_info,
+                            l_out_src, r_out_src, hop);
+  }
+  return status;
+}
 
 /** general utility routines for pv **/
 
@@ -53,7 +82,7 @@
 int
 pv_play_resample (long hop_res, long hop_syn,
 		  double *l_out, double *r_out,
-		  ao_device *ao, SNDFILE *sfout, SF_INFO *sfout_info)
+		  writer_fn callback, void* user_args)
 {
   int status = 0;
 
@@ -105,17 +134,7 @@ pv_play_resample (long hop_res, long hop_syn,
 	  r_out_src [i] = (double)fl_out [i*2 + 1];
 	}
 
-      // output
-      if (sfout == NULL)
-	{
-	  status = ao_write (ao, l_out_src, r_out_src, hop_res);
-	  status /= 4; // 2 bytes for 2 channels
-	}
-      else
-	{
-	  status = sndfile_write (sfout, *sfout_info,
-				  l_out_src, r_out_src, hop_res);
-	}
+      status = callback(hop_res, l_out_src, r_out_src, user_args);
 
       free (fl_in);
       free (fl_out);
@@ -127,16 +146,7 @@ pv_play_resample (long hop_res, long hop_syn,
     {
       // no samplerate conversion (pitch fixed)
       // output
-      if (sfout == NULL)
-	{
-	  status = ao_write (ao, l_out, r_out, hop_syn);
-	  status /= 4; // 2 bytes for 2 channels
-	}
-      else
-	{
-	  status = sndfile_write (sfout, *sfout_info,
-				  l_out, r_out, hop_syn);
-	}
+      status = callback(hop_syn, l_out, r_out, user_args);
     }
 
   return (status);
@@ -181,7 +191,144 @@ get_scale_factor_for_window (int len, long hop_syn, int flag_window)
   return (acc);
 }
 
+void pv_conventional_buffer (int len, double *left, double *right, double *time, double *freq,
+                             double *t_out, double *f_out, double *amp, double *ph_in,
+                             double *l_ph_out, double *r_ph_out, double *omega,
+                             double *l_ph_in_old, double *r_ph_in_old, fftw_plan plan,
+                             fftw_plan plan_inv, double rate, double pitch_shift,
+                             long hop_syn, int flag_window, int *flag_ph,
+                             double *l_out, double *r_out,
+                             writer_fn callback, void *user_args)
+{
+  long hop_ana;
+  long hop_res;
+  hop_res = (long)((double)hop_syn * pow (2.0, - pitch_shift / 12.0));
+  hop_ana = (long)((double)hop_res * rate);
 
+  double twopi = 2.0 * M_PI;
+
+  int i;
+  int k;
+
+  double window_scale;
+  window_scale = get_scale_factor_for_window (len, hop_syn, flag_window);
+
+
+  // left channel
+  apply_FFT (len, left, flag_window, plan, time, freq,
+             1.0,
+             amp, ph_in);
+  if (flag_ph == 0)
+  {
+    // initialize phase
+    for (k = 0; k < (len/2)+1; k ++)
+    {
+      l_ph_out [k] = ph_in [k] * (double)hop_syn / (double)hop_ana;
+      //l_ph_out [k] = ph_in [k];
+
+      // backup for the next step
+      l_ph_in_old [k] = ph_in [k];
+    }
+    //*flag_ph = 1; // right channel is in the following!
+  }
+  else
+  {
+    // only for imag components who have phase
+    for (k = 1; k < ((len+1)/2); k ++)
+    {
+      double dphi;
+      dphi = ph_in [k] - l_ph_in_old [k]
+          - omega [k] * (double)hop_ana;
+      for (; dphi >= M_PI; dphi -= twopi);
+      for (; dphi < -M_PI; dphi += twopi);
+
+      l_ph_out [k] += dphi * (double)hop_syn / (double)hop_ana
+          + omega [k] * (double)hop_syn;
+
+      l_ph_in_old [k] = ph_in [k];
+    }
+  }
+  polar_to_HC (len, amp, l_ph_out, 0, f_out);
+  fftw_execute (plan_inv);
+  // scale by len and windowing
+  windowing (len, t_out, flag_window, (double)len * window_scale, t_out);
+  // superimpose
+  for (i = 0; i < len; i ++)
+  {
+    l_out [hop_syn + i] += t_out [i];
+  }
+
+  // right channel
+  apply_FFT (len, right, flag_window, plan, time, freq,
+             1.0,
+             amp, ph_in);
+  if (flag_ph == 0)
+  {
+    // initialize phase
+    for (k = 0; k < (len/2)+1; k ++)
+    {
+      r_ph_out [k] = ph_in [k] * (double)hop_syn / (double)hop_ana;
+      //r_ph_out [k] = ph_in [k];
+
+      // backup for the next step
+      r_ph_in_old [k] = ph_in [k];
+    }
+    *flag_ph = 1;
+  }
+  else
+  {
+    // only for imag components who have phase
+    for (k = 1; k < ((len+1)/2); k ++)
+    {
+      double dphi;
+      dphi = ph_in [k] - r_ph_in_old [k]
+          - omega [k] * (double)hop_ana;
+      for (; dphi >= M_PI; dphi -= twopi);
+      for (; dphi < -M_PI; dphi += twopi);
+
+      r_ph_out [k] += dphi * (double)hop_syn / (double)hop_ana
+          + omega [k] * (double)hop_syn;
+
+      r_ph_in_old [k] = ph_in [k];
+    }
+  }
+  polar_to_HC (len, amp, r_ph_out, 0, f_out);
+  fftw_execute (plan_inv);
+  // scale by len and windowing
+  //windowing (len, t_out, flag_window, (double)len, t_out);
+  windowing (len, t_out, flag_window, (double)len * window_scale, t_out);
+  // superimpose
+  for (i = 0; i < len; i ++)
+  {
+    r_out [hop_syn + i] += t_out [i];
+  }
+
+
+  // output
+  /*status =*/ pv_play_resample (hop_res, hop_syn, l_out, r_out, callback, user_args);
+
+
+  /* shift acc_out by hop_syn */
+  for (i = 0; i < len; i ++)
+  {
+    l_out [i] = l_out [i + hop_syn];
+    r_out [i] = r_out [i + hop_syn];
+  }
+  for (i = len; i < len + hop_syn; i ++)
+  {
+    l_out [i] = 0.0;
+    r_out [i] = 0.0;
+  }
+
+
+  /* for the next step */
+  for (i = 0; i < (len - hop_ana); i ++)
+  {
+    left  [i] = left  [i + hop_ana];
+    right [i] = right [i + hop_ana];
+  }
+
+}
 
 /* standard phase vocoder
  * Ref: J.Laroche and M.Dolson (1999)
@@ -225,34 +372,6 @@ void pv_conventional (const char *file, const char *outfile,
   CHECK_MALLOC (left,  "pv_conventional");
   CHECK_MALLOC (right, "pv_conventional");
 
-
-  // prepare the output
-  int status;
-  ao_device *ao = NULL;
-  SNDFILE *sfout = NULL;
-  SF_INFO sfout_info;
-  if (outfile == NULL)
-    {
-      ao = ao_init_16_stereo (sfinfo.samplerate, 1 /* verbose */);
-    }
-  else
-    {
-      sfout = sndfile_open_for_write (&sfout_info,
-				      outfile,
-				      sfinfo.samplerate,
-				      sfinfo.channels);
-      if (sfout == NULL)
-	{
-	  fprintf (stderr, "fail to open file %s\n", outfile);
-	  exit (1);
-	}
-    }
-
-
-  double window_scale;
-  window_scale = get_scale_factor_for_window (len, hop_syn, flag_window);
-
-
   /* initialization plan for FFTW  */
   double *time = NULL;
   double *freq = NULL;
@@ -287,21 +406,15 @@ void pv_conventional (const char *file, const char *outfile,
   CHECK_MALLOC (l_ph_out, "pv_conventional");
   CHECK_MALLOC (r_ph_out, "pv_conventional");
 
-  double *l_ph_in_old = NULL;
-  double *r_ph_in_old = NULL;
-  l_ph_in_old = (double *)malloc (((len/2)+1) * sizeof(double));
-  r_ph_in_old = (double *)malloc (((len/2)+1) * sizeof(double));
-  CHECK_MALLOC (l_ph_in_old, "pv_conventional");
-  CHECK_MALLOC (r_ph_in_old, "pv_conventional");
 
   for (i = 0; i < (len/2)+1; i ++)
-    {
-      ph_in [i]  = 0.0;
-      l_ph_out [i] = 0.0;
-      r_ph_out [i] = 0.0;
-      l_ph_in_old [i] = 0.0;
-      r_ph_in_old [i] = 0.0;
-    }
+  {
+    ph_in [i]  = 0.0;
+    l_ph_out [i] = 0.0;
+    r_ph_out [i] = 0.0;
+    /*l_ph_in_old [i] = 0.0;
+      r_ph_in_old [i] = 0.0;*/
+  }
 
   double *l_out = NULL;
   double *r_out = NULL;
@@ -310,20 +423,54 @@ void pv_conventional (const char *file, const char *outfile,
   CHECK_MALLOC (l_out, "pv_conventional");
   CHECK_MALLOC (r_out, "pv_conventional");
   for (i = 0; i < (hop_syn + len); i ++)
-    {
-      l_out [i] = 0.0;
-      r_out [i] = 0.0;
-    }
+  {
+    l_out [i] = 0.0;
+    r_out [i] = 0.0;
+  }
 
   // expected frequency
   double * omega = NULL;
   omega = (double *) malloc (((len/2)+1) * sizeof(double));
   CHECK_MALLOC (omega, "pv_conventional");
   for (k = 0; k < (len/2)+1; k ++)
-    {
-      omega [k] = twopi * (double)k / (double)len;
-    }
+  {
+    omega [k] = twopi * (double)k / (double)len;
+  }
 
+  double *l_ph_in_old = NULL;
+  double *r_ph_in_old = NULL;
+  l_ph_in_old = (double *)malloc (((len/2)+1) * sizeof(double));
+  r_ph_in_old = (double *)malloc (((len/2)+1) * sizeof(double));
+  CHECK_MALLOC (l_ph_in_old, "pv_conventional");
+  CHECK_MALLOC (r_ph_in_old, "pv_conventional");
+
+  for (i = 0; i < (len/2)+1; i ++)
+  {
+    l_ph_in_old [i] = 0.0;
+    r_ph_in_old [i] = 0.0;
+  }
+
+  // prepare the output
+  int status;
+  ao_device *ao = NULL;
+  SNDFILE *sfout = NULL;
+  SF_INFO sfout_info;
+  if (outfile == NULL)
+    {
+      ao = ao_init_16_stereo (sfinfo.samplerate, 1 /* verbose */);
+    }
+  else
+    {
+      sfout = sndfile_open_for_write (&sfout_info,
+				      outfile,
+				      sfinfo.samplerate,
+				      sfinfo.channels);
+      if (sfout == NULL)
+	{
+	  fprintf (stderr, "fail to open file %s\n", outfile);
+	  exit (1);
+	}
+    }
 
   // read the first frame
   read_status = sndfile_read (sf, sfinfo, left, right, len);
@@ -335,120 +482,11 @@ void pv_conventional (const char *file, const char *outfile,
   int flag_ph = 0;
   for (;;)
     {
-      // left channel
-      apply_FFT (len, left, flag_window, plan, time, freq,
-		 1.0,
-		 amp, ph_in);
-      if (flag_ph == 0)
-	{
-	  // initialize phase
-	  for (k = 0; k < (len/2)+1; k ++)
-	    {
-	      l_ph_out [k] = ph_in [k] * (double)hop_syn / (double)hop_ana;
-	      //l_ph_out [k] = ph_in [k];
-
-	      // backup for the next step
-	      l_ph_in_old [k] = ph_in [k];
-	    }
-	  //flag_ph = 1; // right channel is in the following!
-	}
-      else
-	{
-	  // only for imag components who have phase
-	  for (k = 1; k < ((len+1)/2); k ++)
-	    {
-	      double dphi;
-	      dphi = ph_in [k] - l_ph_in_old [k]
-		- omega [k] * (double)hop_ana;
-	      for (; dphi >= M_PI; dphi -= twopi);
-	      for (; dphi < -M_PI; dphi += twopi);
-
-	      l_ph_out [k] += dphi * (double)hop_syn / (double)hop_ana
-		+ omega [k] * (double)hop_syn;
-
-	      l_ph_in_old [k] = ph_in [k];
-	    }
-	}
-      polar_to_HC (len, amp, l_ph_out, 0, f_out);
-      fftw_execute (plan_inv);
-      // scale by len and windowing
-      windowing (len, t_out, flag_window, (double)len * window_scale, t_out);
-      // superimpose
-      for (i = 0; i < len; i ++)
-	{
-	  l_out [hop_syn + i] += t_out [i];
-	}
-
-      // right channel
-      apply_FFT (len, right, flag_window, plan, time, freq,
-		 1.0,
-		 amp, ph_in);
-      if (flag_ph == 0)
-	{
-	  // initialize phase
-	  for (k = 0; k < (len/2)+1; k ++)
-	    {
-	      r_ph_out [k] = ph_in [k] * (double)hop_syn / (double)hop_ana;
-	      //r_ph_out [k] = ph_in [k];
-
-	      // backup for the next step
-	      r_ph_in_old [k] = ph_in [k];
-	    }
-	  flag_ph = 1;
-	}
-      else
-	{
-	  // only for imag components who have phase
-	  for (k = 1; k < ((len+1)/2); k ++)
-	    {
-	      double dphi;
-	      dphi = ph_in [k] - r_ph_in_old [k]
-		- omega [k] * (double)hop_ana;
-	      for (; dphi >= M_PI; dphi -= twopi);
-	      for (; dphi < -M_PI; dphi += twopi);
-
-	      r_ph_out [k] += dphi * (double)hop_syn / (double)hop_ana
-		+ omega [k] * (double)hop_syn;
-
-	      r_ph_in_old [k] = ph_in [k];
-	    }
-	}
-      polar_to_HC (len, amp, r_ph_out, 0, f_out);
-      fftw_execute (plan_inv);
-      // scale by len and windowing
-      //windowing (len, t_out, flag_window, (double)len, t_out);
-      windowing (len, t_out, flag_window, (double)len * window_scale, t_out);
-      // superimpose
-      for (i = 0; i < len; i ++)
-	{
-	  r_out [hop_syn + i] += t_out [i];
-	}
-
-
-      // output
-      status = pv_play_resample (hop_res, hop_syn, l_out, r_out,
-				 ao, sfout, &sfout_info);
-
-
-      /* shift acc_out by hop_syn */
-      for (i = 0; i < len; i ++)
-	{
-	  l_out [i] = l_out [i + hop_syn];
-	  r_out [i] = r_out [i + hop_syn];
-	}
-      for (i = len; i < len + hop_syn; i ++)
-	{
-	  l_out [i] = 0.0;
-	  r_out [i] = 0.0;
-	}
-
-
-      /* for the next step */
-      for (i = 0; i < (len - hop_ana); i ++)
-	{
-	  left  [i] = left  [i + hop_ana];
-	  right [i] = right [i + hop_ana];
-	}
+      struct default_writer_args args = { ao, sfout, &sfout_info };
+      pv_conventional_buffer(len, left, right, time, freq, t_out, f_out, amp, ph_in,
+                             l_ph_out, r_ph_out, omega, l_ph_in_old, r_ph_in_old, plan,
+                             plan_inv, rate, pitch_shift, hop_syn, flag_window, &flag_ph,
+                             l_out, r_out, default_writer, &args);
 
       /* read next segment */
       read_status = sndfile_read (sf, sfinfo,
@@ -479,6 +517,12 @@ void pv_conventional (const char *file, const char *outfile,
   free (left);
   free (right);
 
+  free (l_ph_in_old);
+  free (r_ph_in_old);
+
+  free (l_out);
+  free (r_out);
+
   free (time);
   free (freq);
   fftw_destroy_plan (plan);
@@ -492,11 +536,7 @@ void pv_conventional (const char *file, const char *outfile,
 
   free (l_ph_out);
   free (r_ph_out);
-  free (l_ph_in_old);
-  free (r_ph_in_old);
-
-  free (l_out);
-  free (r_out);
 
   free (omega);
+
 }
