@@ -45,7 +45,21 @@ struct default_writer_args {
   SF_INFO *sfout_info;
 };
 
+struct default_reader_args {
+  SNDFILE *sf;
+  SF_INFO *sfinfo;
+};
+
+struct default_close_args {
+  ao_device *ao;
+  SNDFILE *sfout;
+  SF_INFO *sfout_info;
+  const char *outfile;
+};
+
 typedef int (*writer_fn)(long hop, double *l_out, double *r_out, void *user);
+typedef int (*reader_fn)(long len, double *l_out, double *r_out, void *user);
+typedef int (*close_fn)(long len, double *l_out, double *r_out, void *user);
 
 int default_writer(long hop, double *l_out_src, double *r_out_src, void *user)
 {
@@ -67,6 +81,28 @@ int default_writer(long hop, double *l_out_src, double *r_out_src, void *user)
                             l_out_src, r_out_src, hop);
   }
   return status;
+}
+
+int default_close(long len, double *left, double *right, void* user)
+{
+  struct default_close_args *args = (struct default_close_args *)user;
+  if (args->outfile == NULL)
+  {
+    ao_close (args->ao);
+  }
+  else
+  {
+    // frames left in l_out[] and r_out[]
+    /*status =*/ sndfile_write (args->sfout, *args->sfout_info, left, right, len);
+    sf_write_sync (args->sfout);
+    sf_close (args->sfout);
+  }
+}
+
+int default_reader(long len, double *left, double *right, void* user)
+{
+  struct default_reader_args *args = (struct default_reader_args *)user;
+  return sndfile_read (args->sf, *args->sfinfo, left, right, len);
 }
 
 /** general utility routines for pv **/
@@ -330,13 +366,11 @@ void pv_conventional_buffer (int len, double *left, double *right, double *time,
 
 }
 
-/* standard phase vocoder
- * Ref: J.Laroche and M.Dolson (1999)
- */
-void pv_conventional (const char *file, const char *outfile,
-		      double rate, double pitch_shift,
-		      long len, long hop_syn,
-		      int flag_window)
+void pv_conventional_prefilled (double *all_left, double *all_right, long all_len,
+                                double rate, double pitch_shift,
+                                long len, long hop_syn,
+                                int flag_window, writer_fn callback, void *user_args,
+                                close_fn close_callback, void *close_user_args)
 {
   long hop_ana;
   long hop_res;
@@ -348,21 +382,6 @@ void pv_conventional (const char *file, const char *outfile,
 
   int i;
   int k;
-
-  // open the input file
-  long read_status;
-  // libsndfile version
-  SNDFILE *sf = NULL;
-  SF_INFO sfinfo;
-  memset (&sfinfo, 0, sizeof (sfinfo));
-  sf = sf_open (file, SFM_READ, &sfinfo);
-  if (sf == NULL)
-    {
-      fprintf (stderr, "fail to open %s\n", file);
-      exit (1);
-    }
-  sndfile_print_info (&sfinfo);
-
 
   /* allocate buffers  */
   double * left = NULL;
@@ -450,72 +469,29 @@ void pv_conventional (const char *file, const char *outfile,
     r_ph_in_old [i] = 0.0;
   }
 
-  // prepare the output
-  int status;
-  ao_device *ao = NULL;
-  SNDFILE *sfout = NULL;
-  SF_INFO sfout_info;
-  if (outfile == NULL)
-    {
-      ao = ao_init_16_stereo (sfinfo.samplerate, 1 /* verbose */);
-    }
-  else
-    {
-      sfout = sndfile_open_for_write (&sfout_info,
-				      outfile,
-				      sfinfo.samplerate,
-				      sfinfo.channels);
-      if (sfout == NULL)
-	{
-	  fprintf (stderr, "fail to open file %s\n", outfile);
-	  exit (1);
-	}
-    }
-
-  // read the first frame
-  read_status = sndfile_read (sf, sfinfo, left, right, len);
-  if (read_status != len)
-    {
-      exit (1);
-    }
+  // first frame:
+  memcpy(left, all_left, len * sizeof(double));
+  memcpy(right, all_right, len * sizeof(double));
 
   int flag_ph = 0;
+  long offset = 0;
   for (;;)
-    {
-      struct default_writer_args args = { ao, sfout, &sfout_info };
-      pv_conventional_buffer(len, left, right, time, freq, t_out, f_out, amp, ph_in,
-                             l_ph_out, r_ph_out, omega, l_ph_in_old, r_ph_in_old, plan,
-                             plan_inv, rate, pitch_shift, hop_syn, flag_window, &flag_ph,
-                             l_out, r_out, default_writer, &args);
-
-      /* read next segment */
-      read_status = sndfile_read (sf, sfinfo,
-				  left  + len - hop_ana,
-				  right + len - hop_ana,
-				  hop_ana);
-      if (read_status != hop_ana)
-	{
-	  // most likely, it is EOF.
-	  break;
-	}
+  {
+    pv_conventional_buffer(len, left, right, time, freq, t_out,
+                           f_out, amp, ph_in, l_ph_out, r_ph_out, omega, l_ph_in_old,
+                           r_ph_in_old, plan, plan_inv, rate, pitch_shift, hop_syn,
+                           flag_window, &flag_ph, l_out, r_out, callback, user_args);
+   offset += len;
+    if (offset >= all_len) {
+      break;
     }
+    memcpy(left, left + hop_ana, (len - hop_ana) * sizeof(double));
+    memcpy(right, right + hop_ana, (len - hop_ana) * sizeof(double));
+    memcpy(left + len - hop_ana, all_left + offset, hop_ana * sizeof(double));
+    memcpy(right + len - hop_ana, all_right + offset, hop_ana * sizeof(double)); 
+  }
 
-
-  sf_close (sf);
-  if (outfile == NULL)
-    {
-      ao_close (ao);
-    }
-  else
-    {
-      // frames left in l_out[] and r_out[]
-      status = sndfile_write (sfout, sfout_info, l_out, r_out, len);
-      sf_write_sync (sfout);
-      sf_close (sfout);
-    }
-
-  free (left);
-  free (right);
+  close_callback(len, l_out, r_out, close_user_args);
 
   free (l_ph_in_old);
   free (r_ph_in_old);
@@ -539,4 +515,91 @@ void pv_conventional (const char *file, const char *outfile,
 
   free (omega);
 
+  free (left);
+  free (right);
+}
+
+/* standard phase vocoder
+ * Ref: J.Laroche and M.Dolson (1999)
+ */
+void pv_conventional (const char *file, const char *outfile,
+		      double rate, double pitch_shift,
+		      long len, long hop_syn,
+		      int flag_window)
+{
+  long hop_ana;
+  long hop_res;
+  hop_res = (long)((double)hop_syn * pow (2.0, - pitch_shift / 12.0));
+  hop_ana = (long)((double)hop_res * rate);
+
+  // open the input file
+  long read_status;
+  // libsndfile version
+  SNDFILE *sf = NULL;
+  SF_INFO sfinfo;
+  memset (&sfinfo, 0, sizeof (sfinfo));
+  sf = sf_open (file, SFM_READ, &sfinfo);
+  if (sf == NULL)
+    {
+      fprintf (stderr, "fail to open %s\n", file);
+      exit (1);
+    }
+  sndfile_print_info (&sfinfo);
+
+  // prepare the output
+  int status;
+  ao_device *ao = NULL;
+  SNDFILE *sfout = NULL;
+  SF_INFO sfout_info;
+  if (outfile == NULL)
+    {
+      ao = ao_init_16_stereo (sfinfo.samplerate, 1 /* verbose */);
+    }
+  else
+    {
+      sfout = sndfile_open_for_write (&sfout_info,
+				      outfile,
+				      sfinfo.samplerate,
+				      sfinfo.channels);
+      if (sfout == NULL)
+	{
+	  fprintf (stderr, "fail to open file %s\n", outfile);
+	  exit (1);
+	}
+    }
+
+  // read the first frame
+  double *left = malloc(len * sizeof(double));
+  double *right = malloc(len * sizeof(double));
+  read_status = sndfile_read (sf, sfinfo, left, right, len);
+  if (read_status != len)
+    {
+      exit (1);
+    }
+
+  long all_len = len;
+  long offset = 0;
+  for (;;) {
+    /* read next segment */
+    read_status = sndfile_read (sf, sfinfo,
+                                left  + offset,
+                                right + offset,
+                                hop_ana);
+    if (read_status != hop_ana)
+    {
+      // most likely, it is EOF.
+      all_len -= hop_ana - read_status;
+      break;
+    }
+    offset += len;
+    all_len += len;
+    left = realloc(left, all_len * sizeof(double));
+    right = realloc(right, all_len * sizeof(double));
+  }
+
+  struct default_close_args close_args = { ao, sfout, &sfout_info, outfile };
+  struct default_writer_args args = { ao, sfout, &sfout_info };
+  pv_conventional_prefilled(left, right, all_len, rate, pitch_shift, len, hop_syn,
+                            flag_window, default_writer, &args, default_close, &close_args);
+  sf_close (sf);
 }
